@@ -143,6 +143,7 @@ func handleSubscription(w http.ResponseWriter, r *http.Request, ps httprouter.Pa
 		if err != nil {
 			log.Fatalf("could not marshal filelist: %s", err)
 		}
+		conn.WriteMessage(websocket.TextMessage, []byte(`{"sounds":`+string(buf)+`}`)) // yeah, i don't even give a shit anymore
 		natsConn.Publish(subID+".sounds", buf)
 
 		// TODO: sub cancellation
@@ -155,6 +156,11 @@ func handleSubscription(w http.ResponseWriter, r *http.Request, ps httprouter.Pa
 			for miss := range missing(sds, remoteSds) {
 				log.Printf("missing: %v", miss.Path)
 				requestMissing(subID, miss.Path)
+				buf, err := json.Marshal(listLocalFiles(subID))
+				if err != nil {
+					log.Println(err)
+				}
+				conn.WriteMessage(websocket.TextMessage, buf)
 			}
 		})
 		if err != nil {
@@ -184,7 +190,7 @@ func handleSubscription(w http.ResponseWriter, r *http.Request, ps httprouter.Pa
 	}()
 
 	psub, err := natsConn.Subscribe(subID+".playback", func(m *nats.Msg) {
-		mplayer.SendCommand(fmt.Sprintf(`loadfile "%s/%s"`, subID, m.Data))
+		mplayer.SendCommand(fmt.Sprintf(`loadfile "sounds/%s/%s"`, subID, m.Data))
 		conn.WriteMessage(websocket.TextMessage, []byte(`{"playing": "`+string(m.Data)+`"}`))
 	})
 	if err != nil {
@@ -201,7 +207,7 @@ func handleSubscription(w http.ResponseWriter, r *http.Request, ps httprouter.Pa
 			log.Println(err)
 			return
 		}
-		natsConn.Publish(subID, p)
+		natsConn.Publish(subID+".playback", p)
 	}
 }
 
@@ -216,7 +222,7 @@ func htmlUI(w http.ResponseWriter, r *http.Request, ps httprouter.Params) {
 		var data = JSON.parse(e.data)
 		if(data["sounds"]) {
 			for(s in data["sounds"]){
-				var snd = data["sounds"][s]
+				var snd = data["sounds"][s].Path
 				var n = document.createElement("li")
 				n.onclick = function(evt) {
 					wsconn.send(evt.target.innerText)
