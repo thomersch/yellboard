@@ -162,6 +162,7 @@ func handleSubscription(w http.ResponseWriter, r *http.Request, ps httprouter.Pa
 				}
 				conn.WriteMessage(websocket.TextMessage, buf)
 			}
+			sds = listLocalFiles(subID)
 		})
 		if err != nil {
 			log.Println(err)
