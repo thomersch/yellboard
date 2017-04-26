@@ -81,6 +81,11 @@ func (sl *sndList) UnmarshalJSON(data []byte) error {
 
 func listLocalFiles(directoryID string) sndList {
 	ll := sndList{}
+	err := os.MkdirAll(filepath.Join("sounds", directoryID), 0700)
+	if err != nil {
+		log.Println("could not create sound directory: %s", filepath.Join("sounds", directoryID))
+		return nil
+	}
 	filepath.Walk(filepath.Join("sounds", directoryID), func(path string, fi os.FileInfo, err error) error {
 		if fi != nil && !fi.IsDir() {
 			_, fn := filepath.Split(path)
