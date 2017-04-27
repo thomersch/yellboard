@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"sort"
 	"time"
 
 	"github.com/HorayNarea/go-mplayer"
@@ -64,6 +65,9 @@ func (sl sndList) MarshalJSON() ([]byte, error) {
 	for s := range sl {
 		o = append(o, s)
 	}
+	sort.Slice(o, func(i, j int) bool {
+		return o[i].Path < o[j].Path
+	})
 	return json.Marshal(&o)
 }
 
