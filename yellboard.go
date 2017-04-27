@@ -243,8 +243,9 @@ func htmlUI(w http.ResponseWriter, r *http.Request, ps httprouter.Params) {
 	#sounds li {
 		padding:0.5rem;
 		margin-right:0.5rem;
+		margin-bottom: 0.5rem;
 		border: 1px solid #CCCCCC;
-		display:inline;
+		display:inline-block;
 	}
 </style>
 </head>
