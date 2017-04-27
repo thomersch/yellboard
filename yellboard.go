@@ -267,7 +267,11 @@ func htmlUI(w http.ResponseWriter, r *http.Request, ps httprouter.Params) {
 	var wsconn = new WebSocket('ws://localhost:8090/subscribe')
 	wsconn.onmessage = function(e) {
 		var data = JSON.parse(e.data)
+		var sounds = document.getElementById("sounds")
 		if(data["sounds"]) {
+			while (sounds.firstChild) {
+				sounds.removeChild(sounds.firstChild);
+			}
 			for(s in data["sounds"]){
 				var snd = data["sounds"][s].Path
 				var n = document.createElement("li")
@@ -279,7 +283,7 @@ func htmlUI(w http.ResponseWriter, r *http.Request, ps httprouter.Params) {
 				}
 				var t = document.createTextNode(snd)
 				n.appendChild(t)
-				document.getElementById("sounds").appendChild(n)
+				sounds.appendChild(n)
 			}
 		}
 	}
