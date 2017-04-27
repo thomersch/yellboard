@@ -11,6 +11,8 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
+	"sync"
 	"time"
 
 	"github.com/HorayNarea/go-mplayer"
@@ -22,32 +24,127 @@ import (
 var (
 	natsConn *nats.Conn
 	bctx     context.Context
+
+	// TODO: solve this nicer
+	subscriptionID string
+
+	wsConns    []wsConnWriter
+	wsConnsMtx sync.Mutex
 )
 
 func main() {
 	hostPort := flag.String("listen", "localhost:8090", "host and port to listen on")
 	natsURL := flag.String("nats", "nats://localhost:4222", "URL to NATS broker")
+	groupID := flag.String("group", "QmaGkAk6ZgMnJGiLuoAsNKcQ8uionLH4qxJSDbttcaXMyg", "group identifier")
 	flag.Parse()
 
 	var cf context.CancelFunc
 	bctx, cf = context.WithCancel(context.Background())
 	defer cf()
 
+	err := subscribe(*natsURL, *groupID)
+	if err != nil {
+		log.Println(err)
+		return
+	}
+
 	go func() {
 		mplayer.StartSlave()
 	}()
 
-	var err error
-	natsConn, err = nats.Connect(*natsURL)
-	if err != nil {
-		log.Fatal(err)
-	}
-
 	router := httprouter.New()
 	router.GET("/", htmlUI)
-	router.GET("/subscribe/:id", handleSubscription)
-	log.Println("🎙")
+	router.GET("/subscribe", handleSubscription)
+	log.Printf("🎙  listening on %s", *hostPort)
 	http.ListenAndServe(*hostPort, router)
+}
+
+func subscribe(natsURL, subID string) error {
+	subscriptionID = subID
+
+	var err error
+	natsConn, err = nats.Connect(natsURL)
+	if err != nil {
+		return err
+	}
+
+	// list local sounds and broadcast
+	broadcast(subID)
+	go func() {
+		for range time.Tick(time.Minute) {
+			broadcast(subID)
+		}
+	}()
+
+	_, err = natsConn.Subscribe(subID+".sounds", func(m *nats.Msg) {
+		remoteSds := sndList{}
+		if err := json.Unmarshal(m.Data, &remoteSds); err != nil {
+			log.Printf("could not read remote sound info: %s", err)
+			return
+		}
+		for miss := range missing(subID, remoteSds) {
+			log.Printf("attempting to sync %s", miss.Path)
+			requestMissing(subID, miss.Path)
+		}
+	})
+	if err != nil {
+		return err
+	}
+
+	_, err = natsConn.Subscribe(subID+".sounds.payload", func(m *nats.Msg) {
+		// TODO: path sanitation
+		fn := string(m.Data)
+		f, err := os.Open(filepath.Join("sounds", subID, fn))
+		if err != nil {
+			// probably doesn't have the file, skip
+			return
+		}
+		buf, err := ioutil.ReadAll(f)
+		if err != nil {
+			log.Printf("could not read requested sound data: %s", err)
+			return
+		}
+		natsConn.Publish(m.Reply, buf)
+	})
+
+	_, err = natsConn.Subscribe(subID+".playback", func(m *nats.Msg) {
+		mplayer.SendCommand(fmt.Sprintf(`loadfile "sounds/%s/%s"`, subID, m.Data))
+		wsConnsMtx.Lock()
+		defer wsConnsMtx.Unlock()
+		for _, wsConn := range wsConns {
+			wsConn.WriteMessage(websocket.TextMessage, []byte(`{"playing": "`+string(m.Data)+`"}`))
+		}
+	})
+	return err
+}
+
+// broadcast informs all group members about the local sound list
+func broadcast(subID string) error {
+	sds := listLocalFiles(subID)
+
+	buf, err := json.Marshal(sds)
+	if err != nil {
+		return err
+	}
+
+	log.Printf("📣  broadcasting %d sounds", len(sds))
+	// notify remote peers
+	natsConn.Publish(subID+".sounds", buf)
+
+	// notify local clients
+	wsConnsMtx.Lock()
+	defer wsConnsMtx.Unlock()
+	sdsMsg := struct {
+		Sounds sndList `json:"sounds"`
+	}{sds}
+	buf, err = json.Marshal(sdsMsg)
+	if err != nil {
+		return err
+	}
+	for _, wsConn := range wsConns {
+		wsConn.WriteMessage(websocket.TextMessage, buf)
+	}
+	return nil
 }
 
 var upgrader = websocket.Upgrader{
@@ -66,7 +163,7 @@ func (sl sndList) MarshalJSON() ([]byte, error) {
 		o = append(o, s)
 	}
 	sort.Slice(o, func(i, j int) bool {
-		return o[i].Path < o[j].Path
+		return strings.ToLower(o[i].Path) < strings.ToLower(o[j].Path)
 	})
 	return json.Marshal(&o)
 }
@@ -100,7 +197,8 @@ func listLocalFiles(directoryID string) sndList {
 	return ll
 }
 
-func missing(local, remote sndList) sndList {
+func missing(subID string, remote sndList) sndList {
+	local := listLocalFiles(subID)
 	miss := sndList{}
 	for snd := range remote {
 		_, ok := local[snd]
@@ -131,88 +229,32 @@ func requestMissing(subID string, filename string) {
 	}
 }
 
+type wsConnWriter interface {
+	WriteMessage(messageType int, data []byte) error
+}
+
 func handleSubscription(w http.ResponseWriter, r *http.Request, ps httprouter.Params) {
-	subID := ps.ByName("id")
-	if len(subID) == 0 {
-		return
-	}
 	conn, err := upgrader.Upgrade(w, r, nil)
 	if err != nil {
 		log.Println(err)
 		return
 	}
-	go func() {
-		sds := listLocalFiles(subID)
-		buf, err := json.Marshal(sds)
-		if err != nil {
-			log.Fatalf("could not marshal filelist: %s", err)
-		}
-		conn.WriteMessage(websocket.TextMessage, []byte(`{"sounds":`+string(buf)+`}`)) // yeah, i don't even give a shit anymore
-		natsConn.Publish(subID+".sounds", buf)
 
-		// TODO: sub cancellation
-		_, err = natsConn.Subscribe(subID+".sounds", func(m *nats.Msg) {
-			remoteSds := sndList{}
-			if err := json.Unmarshal(m.Data, &remoteSds); err != nil {
-				log.Printf("could not read remote sound info: %s", err)
-				return
-			}
-			for miss := range missing(sds, remoteSds) {
-				log.Printf("missing: %v", miss.Path)
-				requestMissing(subID, miss.Path)
-				buf, err := json.Marshal(listLocalFiles(subID))
-				if err != nil {
-					log.Println(err)
-				}
-				conn.WriteMessage(websocket.TextMessage, buf)
-			}
-			sds = listLocalFiles(subID)
-		})
-		if err != nil {
-			log.Println(err)
-			return
-		}
+	wsConnsMtx.Lock()
+	conn.WriteMessage(websocket.TextMessage, []byte(`{"salutation": "hello, moto"}`))
+	wsConns = append(wsConns, conn)
+	wsConnsMtx.Unlock()
 
-		_, err = natsConn.Subscribe(subID+".sounds.payload", func(m *nats.Msg) {
-			// TODO: path sanitation
-			fn := string(m.Data)
-			f, err := os.Open(filepath.Join("sounds", subID, fn))
-			if err != nil {
-				// probably doesn't have the file, skip
-				return
-			}
-			buf, err := ioutil.ReadAll(f)
-			if err != nil {
-				log.Printf("could not read requested sound data: %s", err)
-				return
-			}
-			natsConn.Publish(m.Reply, buf)
-		})
-		if err != nil {
-			log.Println(err)
-			return
-		}
-	}()
-
-	psub, err := natsConn.Subscribe(subID+".playback", func(m *nats.Msg) {
-		mplayer.SendCommand(fmt.Sprintf(`loadfile "sounds/%s/%s"`, subID, m.Data))
-		conn.WriteMessage(websocket.TextMessage, []byte(`{"playing": "`+string(m.Data)+`"}`))
-	})
-	if err != nil {
-		log.Println(err)
-		return
-	}
-
-	conn.WriteMessage(websocket.TextMessage, []byte(`{"salutation": "hello, moto #`+ps.ByName("id")+`"}`))
+	//TODO: maybe this could be solved nicer
+	broadcast(subscriptionID)
 
 	for {
 		_, p, err := conn.ReadMessage()
 		if err != nil {
-			psub.Unsubscribe()
 			log.Println(err)
 			return
 		}
-		natsConn.Publish(subID+".playback", p)
+		natsConn.Publish(subscriptionID+".playback", p)
 	}
 }
 
@@ -222,7 +264,7 @@ func htmlUI(w http.ResponseWriter, r *http.Request, ps httprouter.Params) {
 <html>
 <head>
 <script>
-	var wsconn = new WebSocket('ws://localhost:8090/subscribe/QmaGkAk6ZgMnJGiLuoAsNKcQ8uionLH4qxJSDbttcaXMyg')
+	var wsconn = new WebSocket('ws://localhost:8090/subscribe')
 	wsconn.onmessage = function(e) {
 		var data = JSON.parse(e.data)
 		if(data["sounds"]) {
@@ -230,6 +272,9 @@ func htmlUI(w http.ResponseWriter, r *http.Request, ps httprouter.Params) {
 				var snd = data["sounds"][s].Path
 				var n = document.createElement("li")
 				n.onclick = function(evt) {
+					// d = {
+					// 	"play": evt.target.innerText
+					// }
 					wsconn.send(evt.target.innerText)
 				}
 				var t = document.createTextNode(snd)
